@@ -1,0 +1,166 @@
+# dashboard.yaml — Kubernetes manifests for Fluidstack GPU Dashboard
+# Apply with: kubectl apply -f dashboard.yaml  OR  python deploy.py
+
+---
+# ─── Deployment: GPU Dashboard (backend + frontend) ─────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fluidstack-gpu-dashboard
+  labels:
+    app: fluidstack-gpu-dashboard
+    hackathon: power-to-prefill
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fluidstack-gpu-dashboard
+  template:
+    metadata:
+      labels:
+        app: fluidstack-gpu-dashboard
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/prometheus"
+    spec:
+      containers:
+        # ── FastAPI Backend ──
+        - name: backend
+          image: python:3.11-slim
+          command:
+            - sh
+            - -c
+            - |
+              pip install fastapi uvicorn requests prometheus_client &&
+              cd /app && python -m uvicorn app:app --host 0.0.0.0 --port 8000
+          ports:
+            - containerPort: 8000
+              name: api
+          env:
+            - name: FLUIDSTACK_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fluidstack-credentials
+                  key: api-key
+                  optional: true
+            - name: NUM_MOCK_GPUS
+              value: "4"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+              nvidia.com/gpu: "0"   # Set to 1+ when running on GPU nodes
+          volumeMounts:
+            - name: app-code
+              mountPath: /app
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+        # ── Streamlit Frontend ──
+        - name: frontend
+          image: python:3.11-slim
+          command:
+            - sh
+            - -c
+            - |
+              pip install streamlit plotly requests pandas numpy &&
+              cd /app && streamlit run dashboard.py --server.port=8501 --server.headless=true --server.address=0.0.0.0
+          ports:
+            - containerPort: 8501
+              name: ui
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: app-code
+              mountPath: /app
+
+      volumes:
+        - name: app-code
+          configMap:
+            name: fluidstack-dashboard-code
+            optional: true
+        # NOTE: In production, mount app code via a proper container image
+        # or use an initContainer to clone from git.
+
+---
+# ─── Service: NodePort for external access ──────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: fluidstack-gpu-dashboard-svc
+  labels:
+    app: fluidstack-gpu-dashboard
+spec:
+  type: NodePort
+  selector:
+    app: fluidstack-gpu-dashboard
+  ports:
+    - name: api
+      port: 8000
+      targetPort: 8000
+      nodePort: 30800
+    - name: ui
+      port: 8501
+      targetPort: 8501
+      nodePort: 30851
+
+---
+# ─── NVIDIA Device Plugin DaemonSet ─────────────────────────────────────────
+# Required for GPU scheduling on Fluidstack/bare-metal/cloud k8s nodes.
+# On Fluidstack managed clusters, this is typically pre-installed.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin
+  namespace: kube-system
+  labels:
+    app: nvidia-device-plugin
+spec:
+  selector:
+    matchLabels:
+      app: nvidia-device-plugin
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: nvidia-device-plugin
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      priorityClassName: system-node-critical
+      containers:
+        - name: nvidia-device-plugin
+          image: nvcr.io/nvidia/k8s-device-plugin:v0.15.0
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
