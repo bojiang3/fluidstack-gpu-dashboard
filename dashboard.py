@@ -87,6 +87,7 @@ slurm_jobs = api_get("/slurm/jobs")
 slurm_nodes = api_get("/slurm/nodes")
 alerts_data = api_get("/alerts")
 bench_data = api_get("/benchmark")
+xid_data = api_get("/xid")
 
 # ── Sources ──
 if data:
@@ -94,7 +95,7 @@ if data:
     st.markdown("**Data:** %s" % " ".join(sbadge(s) for s in srcs), unsafe_allow_html=True)
 
 # ── Tabs ──
-t1, t2, t3, t4, t5, t6 = st.tabs(["📊 Overview", "🖥️ Cluster Map", "📋 Slurm Jobs", "🔔 Alerts", "⚔️ vs Ray", "🖥️ System"])
+t1, t2, t3, t4, t5, t6, t7 = st.tabs(["📊 Overview", "🖥️ Cluster Map", "📋 Slurm Jobs", "🔔 Alerts", "⚠️ Xid Errors", "⚔️ vs Ray", "🖥️ System"])
 
 # ══════════════════════════════════════════════
 # TAB: OVERVIEW
@@ -278,9 +279,71 @@ with t4:
 
 
 # ══════════════════════════════════════════════
-# TAB: BENCHMARK
+# TAB: XID ERRORS (NVIDIA GPU hardware faults)
 # ══════════════════════════════════════════════
 with t5:
+    st.subheader("NVIDIA Xid Error Monitor")
+    st.markdown("""
+    Xid errors are **GPU hardware/driver faults** logged to the Linux kernel.
+    Critical Xid codes (48, 74, 79, 95) indicate ECC errors, NVLink failures, or GPU falling off the bus.
+    [NVIDIA Xid Reference](https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/dcgm-error-injection.html)
+    """)
+
+    if xid_data:
+        errors = xid_data.get("xid_errors", [])
+        count = xid_data.get("count", 0)
+        st.markdown("Source: %s" % sbadge("kernel-log"), unsafe_allow_html=True)
+
+        if count == 0:
+            st.success("✅ No Xid errors detected in kernel logs. Cluster GPUs healthy.")
+        else:
+            critical = [e for e in errors if e["severity"] == "critical"]
+            warning = [e for e in errors if e["severity"] == "warning"]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Xid Errors", count)
+            c2.metric("Critical", len(critical))
+            c3.metric("Warning", len(warning))
+
+            for e in errors:
+                if e["severity"] == "critical":
+                    cls = "ac"
+                    icon = "🔴"
+                elif e["severity"] == "warning":
+                    cls = "aw"
+                    icon = "🟡"
+                else:
+                    cls = "aa"
+                    icon = "🔵"
+                st.markdown(
+                    '<div class="%s"><b>%s Xid %d: %s</b><br>'
+                    '<span style="font-family:JetBrains Mono,monospace;font-size:0.8rem;">%s</span>'
+                    '%s</div>' % (
+                        cls, icon, e["xid"], e["description"],
+                        e.get("raw", "")[:150],
+                        (" · PCI: %s" % e["pci_address"]) if e.get("pci_address") else "",
+                    ), unsafe_allow_html=True)
+
+        # Xid reference table
+        st.markdown("### Xid Code Reference")
+        xid_ref = [
+            {"Code": 13, "Name": "Graphics Engine Exception", "Severity": "Warning"},
+            {"Code": 31, "Name": "GPU memory page fault", "Severity": "Warning"},
+            {"Code": 48, "Name": "Double Bit ECC Error", "Severity": "Critical"},
+            {"Code": 74, "Name": "NVLink Error", "Severity": "Critical"},
+            {"Code": 79, "Name": "GPU fallen off the bus", "Severity": "Critical"},
+            {"Code": 92, "Name": "High single-bit ECC rate", "Severity": "Warning"},
+            {"Code": 94, "Name": "Contained ECC error", "Severity": "Warning"},
+            {"Code": 95, "Name": "Uncontained ECC error", "Severity": "Critical"},
+        ]
+        st.dataframe(pd.DataFrame(xid_ref), use_container_width=True, hide_index=True)
+    else:
+        st.info("Cannot fetch Xid data. Backend may not have SSH access to cluster.")
+
+
+# ══════════════════════════════════════════════
+# TAB: BENCHMARK
+# ══════════════════════════════════════════════
+with t6:
     st.subheader("Fluidstack Dashboard vs Ray Dashboard")
     st.markdown("> Purpose-built for **Fluidstack Slurm clusters** with real squeue/sinfo, SSH-based nvidia-smi, anomaly detection, and Prometheus export.")
     if bench_data and bench_data.get("comparison"):
@@ -301,7 +364,7 @@ with t5:
 # ══════════════════════════════════════════════
 # TAB: SYSTEM
 # ══════════════════════════════════════════════
-with t6:
+with t7:
     if data and data.get("system"):
         s = data["system"]
         st.subheader("Host System Metrics")

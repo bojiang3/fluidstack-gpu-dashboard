@@ -71,12 +71,16 @@ def ssh_cmd(cmd, timeout=20):
         return ""
     try:
         ssh_args = ["ssh", "-o", "StrictHostKeyChecking=no",
-                    "-o", "ConnectTimeout=8", "-o", "BatchMode=yes"]
+                    "-o", "ConnectTimeout=8"]
         if SSH_KEY_PATH and os.path.exists(SSH_KEY_PATH):
             ssh_args += ["-i", SSH_KEY_PATH]
         ssh_args += [CLUSTER_HOST, cmd]
         result = subprocess.run(ssh_args, capture_output=True, text=True, timeout=timeout)
         if result.returncode == 0:
+            return result.stdout
+        # Non-zero return but might still have useful stdout
+        if result.stdout.strip():
+            print("[ssh] non-zero exit but got output, using it")
             return result.stdout
         if result.stderr.strip():
             print("[ssh stderr] %s" % result.stderr.strip()[:200])
@@ -191,7 +195,7 @@ def collect_gpu_metrics():
 
 # === LAYER 3: SLURM (squeue + sinfo via SSH) ===
 def fetch_slurm_jobs():
-    output = ssh_cmd("squeue --format='%.18i %.30j %.8u %.8T %.10M %.6D %.30R' --noheader 2>/dev/null")
+    output = ssh_cmd("squeue --noheader -o '%.18i %.30j %.8u %.8T %.10M %.6D %.30R' 2>/dev/null || squeue --noheader 2>/dev/null")
     if not output.strip():
         return []
     jobs = []
@@ -208,7 +212,7 @@ def fetch_slurm_jobs():
 
 
 def fetch_slurm_nodes():
-    output = ssh_cmd("sinfo --format='%n %G %C %m %T' --noheader 2>/dev/null")
+    output = ssh_cmd("sinfo --noheader -o '%n %G %C %m %T' 2>/dev/null || sinfo --noheader 2>/dev/null")
     if not output.strip():
         return []
     nodes = []
@@ -383,6 +387,87 @@ async def alerts():
                     "message":"Anomaly z=%.1f (val=%.1f, mean=%.1f)" % (a["z_score"],a["value"],a["mean"]),
                     "type":"anomaly"})
     return {"alerts": al, "count": len(al)}
+
+
+# === LAYER 5: XID ERROR DETECTION (via SSH dmesg/journalctl) ===
+# Xid errors are NVIDIA GPU hardware/driver errors logged to kernel.
+# Reference: https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/dcgm-error-injection.html
+XID_DESCRIPTIONS = {
+    13: "Graphics Engine Exception", 31: "GPU memory page fault",
+    32: "Invalid or corrupted push buffer stream",
+    38: "Driver firmware error", 43: "GPU stopped processing",
+    45: "Preemptive cleanup, due to previous errors",
+    48: "Double Bit ECC Error", 56: "Display Engine error",
+    61: "Internal micro-controller breakpoint/warning",
+    62: "Internal micro-controller halt", 63: "ECC page retirement recording event",
+    64: "ECC page retirement recording failure",
+    68: "NVDEC0 Exception", 69: "Graphics Engine class error",
+    74: "NVLink Error", 79: "GPU has fallen off the bus",
+    92: "High single-bit ECC error rate", 94: "Contained ECC error",
+    95: "Uncontained ECC error",
+}
+
+cached_xid_errors = []
+
+def fetch_xid_errors():
+    """Parse Xid errors from cluster via SSH. Tries journalctl then dmesg."""
+    # Try journalctl first (systemd), then dmesg
+    output = ssh_cmd(
+        "journalctl -k --no-pager -n 200 2>/dev/null | grep -i 'xid' | tail -20 || "
+        "dmesg 2>/dev/null | grep -i 'xid' | tail -20 || "
+        "echo ''",
+        timeout=15,
+    )
+    errors = []
+    if not output.strip():
+        return errors
+    import re
+    for line in output.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # Parse: "NVRM: Xid (PCI:0000:b1:00): 13, pid=12345, ..."
+        xid_match = re.search(r'[Xx]id\s*\(?[^)]*\)?\s*:?\s*(\d+)', line)
+        if xid_match:
+            xid_num = int(xid_match.group(1))
+            # Try to extract timestamp
+            ts_match = re.search(r'(\w{3}\s+\d+\s+\d+:\d+:\d+|\d{4}-\d{2}-\d{2}T\d+:\d+:\d+)', line)
+            ts = ts_match.group(1) if ts_match else ""
+            # Try to extract PCI address
+            pci_match = re.search(r'PCI:([0-9a-f:]+)', line, re.IGNORECASE)
+            pci = pci_match.group(1) if pci_match else ""
+            errors.append({
+                "xid": xid_num,
+                "description": XID_DESCRIPTIONS.get(xid_num, "Unknown Xid %d" % xid_num),
+                "severity": "critical" if xid_num in (48, 74, 79, 95) else "warning",
+                "raw": line[:200],
+                "timestamp": ts,
+                "pci_address": pci,
+                "source": "kernel-log",
+            })
+        elif "xid" in line.lower():
+            # Catch any other Xid-related lines
+            errors.append({
+                "xid": 0, "description": "Xid-related event",
+                "severity": "info", "raw": line[:200],
+                "timestamp": "", "pci_address": "", "source": "kernel-log",
+            })
+    return errors
+
+
+@app.get("/xid")
+async def get_xid_errors():
+    """Fetch NVIDIA Xid errors from cluster kernel logs."""
+    global cached_xid_errors
+    errors = fetch_xid_errors()
+    if errors:
+        cached_xid_errors = errors
+    return {
+        "xid_errors": cached_xid_errors,
+        "count": len(cached_xid_errors),
+        "source": "ssh-journalctl/dmesg",
+        "info": "Xid errors are NVIDIA GPU hardware/driver faults. See docs.nvidia.com/datacenter/dcgm",
+    }
 
 @app.get("/benchmark")
 async def benchmark():
