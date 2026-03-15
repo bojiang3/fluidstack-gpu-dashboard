@@ -1,6 +1,6 @@
 # ⚡ Fluidstack GPU Dashboard — *Power to Prefill*
 
-> **Hackathon 2025** · Replacing Ray Dashboard for AI Infrastructure Monitoring
+> **Hackathon 2026** · Replacing Ray Dashboard for AI Infrastructure Monitoring
 >
 > *"The future of AI infra isn't just about compute — it's about knowing where every watt goes."*
 > — Inspired by Gary Wu's vision for observable, efficient GPU clusters
